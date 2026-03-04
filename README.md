@@ -19,6 +19,35 @@ Wifislam is a toolkit designed for the analysis and exploitation of Wi-Fi networ
 
 ## How to use
 
+```
+     __       __  __  ________  __            __
+    /  |  _  /  |/  |/        |/  |          /  |
+    $$ | / \ $$ |$$/ $$$$$$$$/ $$/   _______ $$ |  ______   _____  ____
+    $$ |/$  \$$ |/  |$$ |__    /  | /       |$$ | /      \ /     \/    \
+    $$ /$$$  $$ |$$ |$$    |   $$ |/$$$$$$$/ $$ | $$$$$$  |$$$$$$ $$$$  |
+    $$ $$/$$ $$ |$$ |$$$$$/    $$ |$$      \ $$ | /    $$ |$$ | $$ | $$ |
+    $$$$/  $$$$ |$$ |$$ |      $$ | $$$$$$  |$$ |/$$$$$$$ |$$ | $$ | $$ |
+    $$$/    $$$ |$$ |$$ |      $$ |/     $$/ $$ |$$    $$ |$$ | $$ | $$ |
+    $$/      $$/ $$/ $$/       $$/ $$$$$$$/  $$/  $$$$$$$/ $$/  $$/  $$/
+
+
+    A toolbox for WiFi scanning and attacking.
+
+    WARNING: Do not use for illegal purposes!
+
+Usage: wifislam [COMMAND]
+
+Commands:
+  ifaces  List WiFi available WiFi interfaces.
+  scan    Scan for available WiFi devices nearby.
+  kick    Send deauthentication frames to disconnect a client or AP.
+  slam    Continuously scan for, and deauth all detected WiFi devices.
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
 
 ### Notes
 
