@@ -127,10 +127,18 @@ fn scan(running: Arc<AtomicBool>, iface: &String) {
         }
     });
 
+    // Register hopper sync vars
+    let channel = Arc::new(AtomicU16::new(1));
+    let channel_hopper = channel.clone(); // For the hopper thread
+    let running_hopper = running.clone();
+
+    // 4. Start channel hopper
+    models::interfaces::start_channel_hopper(iface.clone(), running_hopper, channel_hopper);
+
     // 4. Main thread blocks here, running the capture loop
     // Because this handles Ctrl+C, it will gracefully exit and clean up the interface
-    run_monitor_handler(running, iface, |cap, current_channel| {
-        models::scanner::capture_packet(cap, &networks, current_channel);
+    run_monitor_handler(running, iface, |cap| {
+        models::scanner::capture_packet(cap, &networks, &channel);
     });
 
     // // 5. Print the final summary after the user presses Ctrl+C and the loop exits
@@ -145,7 +153,7 @@ fn kick(running: Arc<AtomicBool>, iface: &String, address: &String) {
     println!("[ ] Kicking {} on {}...", address, iface);
 
     // Accept `cap` here too!
-    run_monitor_handler(running, iface, |_cap, _current_channel| {
+    run_monitor_handler(running, iface, |_cap| {
         // TODO: Implement actual deauth packet injection here
     });
 }
@@ -154,7 +162,7 @@ fn slam(running: Arc<AtomicBool>, iface: &String) {
     println!("[ ] Slamming all WiFi devices on {}...", iface);
 
     // Accept `cap` here too!
-    run_monitor_handler(running, iface, |_cap, _current_channel| {
+    run_monitor_handler(running, iface, |_cap| {
         // TODO: Implement slam logic here
     });
 }
@@ -163,15 +171,10 @@ fn slam(running: Arc<AtomicBool>, iface: &String) {
 fn run_monitor_handler<F>(running: Arc<AtomicBool>, iface: &String, mut action: F)
 where
     // UPDATE: The closure now requires a mutable reference to the Capture handle
-    F: FnMut(&mut Capture<Active>, &Arc<AtomicU16>),
+    F: FnMut(&mut Capture<Active>),
 {
     // 1. Set initial state variables
     let running_ctrlc = running.clone();
-    let running_hopper = running.clone(); // Clone for the hopper thread
-
-    // Register channels
-    let channel = Arc::new(AtomicU16::new(1));
-    let channel_hopper = channel.clone(); // For the hopper thread
 
     // 2. Register the Ctrl+C handler
     ctrlc::set_handler(move || {
@@ -191,12 +194,9 @@ where
 
     println!("[ ] Running... Press Ctrl+C to stop.");
 
-    // 4. Start channel hopper
-    models::interfaces::start_channel_hopper(iface.clone(), running_hopper, channel_hopper);
-
     // 5. Call closure
     while running.load(Ordering::SeqCst) {
-        action(&mut monitor_guard.capture_handle, &channel);
+        action(&mut monitor_guard.capture_handle);
     }
 
     println!("[ ] Exiting process...");
