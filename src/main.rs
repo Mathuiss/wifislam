@@ -111,11 +111,9 @@ fn list_interfaces() {
 fn scan(running: Arc<AtomicBool>, iface: &String) {
     println!("Starting WiFi scan on {}...", iface);
 
-    // 1. Wrap the HashMap in an Arc<Mutex<>>
+    // Wrap the HashMap in an Arc<Mutex<>>
     let networks = Arc::new(Mutex::new(HashMap::new()));
-
-    // 2. Clone the Arc for the UI thread
-    let networks_print = Arc::clone(&networks);
+    let networks_print = Arc::clone(&networks); // For print thread
 
     // 3. Spawn the background UI thread
     let running_print = running.clone();
@@ -135,13 +133,13 @@ fn scan(running: Arc<AtomicBool>, iface: &String) {
     // 4. Start channel hopper
     models::interfaces::start_channel_hopper(iface.clone(), running_hopper, channel_hopper);
 
-    // 4. Main thread blocks here, running the capture loop
+    // 5. Main thread blocks here, running the capture loop
     // Because this handles Ctrl+C, it will gracefully exit and clean up the interface
     run_monitor_handler(running, iface, |cap| {
         models::scanner::capture_packet(cap, &networks, &channel);
     });
 
-    // // 5. Print the final summary after the user presses Ctrl+C and the loop exits
+    // 6. Print the final summary after the user presses Ctrl+C and the loop exits
     println!();
 
     let final_networks = networks.lock().unwrap();
@@ -194,7 +192,7 @@ where
 
     println!("[ ] Running... Press Ctrl+C to stop.");
 
-    // 5. Call closure
+    // 4. Call closure
     while running.load(Ordering::SeqCst) {
         action(&mut monitor_guard.capture_handle);
     }
