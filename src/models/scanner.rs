@@ -1,137 +1,331 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use libwifi;
+use libwifi::frame::components::FrameControl;
+use libwifi::frame::components::MacAddress;
 use libwifi::Frame;
 use pcap::Active;
 use pcap::Capture;
+
+#[derive(Debug, Clone)]
+pub struct Client {
+    pub mac: String,
+    pub packet_count: u32,
+}
 
 #[derive(Debug, Clone)]
 pub struct AccessPoint {
     pub bssid: String,
     pub ssid: String,
     pub beacon_count: u32,
+    // A map of connected clients, keyed by the client's MAC address
+    pub clients: HashMap<String, Client>,
 }
 
-pub fn capture_packets(cap: &mut Capture<Active>, networks: &mut HashMap<String, AccessPoint>) {
+/// Represents the actionable data we extracted from a raw packet
+pub enum ParsedPacket {
+    /// A router broadcasting its existence
+    ApBeacon { bssid: String, ssid: String },
+    /// A device actively communicating with a router
+    ClientActivity { bssid: String, client_mac: String },
+}
+
+pub fn capture_packets(
+    cap: &mut Capture<Active>,
+    networks_arc: &Arc<Mutex<HashMap<String, AccessPoint>>>,
+) {
     match cap.next_packet() {
         Ok(packet) => {
-            // Pass the raw bytes to our new scanner model
-            if let Some(ap) = self::process_packet(packet.data) {
-                // Update the existing entry or insert the new one
-                networks
-                    .entry(ap.bssid.clone())
-                    .and_modify(|existing_ap| existing_ap.beacon_count += 1)
-                    .or_insert_with(|| {
-                        // This closure only runs if it's a completely new network
-                        println!("[+] New Network: {:<17} | SSID: {}", ap.bssid, ap.ssid);
-                        ap
-                    });
+            if let Some(parsed) = process_packet(packet.data) {
+                // Lock the Mutex only when we have data to write
+                let mut networks = networks_arc.lock().unwrap();
+
+                match parsed {
+                    ParsedPacket::ApBeacon { bssid, ssid } => {
+                        // Insert or update the AP
+                        networks
+                            .entry(bssid.clone())
+                            .and_modify(|ap| {
+                                ap.beacon_count += 1;
+                                // If we previously inferred this AP from client traffic,
+                                // update its SSID now that we have a real Beacon!
+                                if ap.ssid == "<Unknown>" && ssid != "<Hidden>" {
+                                    ap.ssid = ssid.clone();
+                                }
+                            })
+                            .or_insert_with(|| {
+                                AccessPoint {
+                                    bssid,
+                                    ssid,
+                                    beacon_count: 1,
+                                    clients: HashMap::new(), // Initialize empty client map
+                                }
+                            });
+                    }
+                    ParsedPacket::ClientActivity { bssid, client_mac } => {
+                        // 1. Fetch the AP, or create a placeholder if we haven't seen it yet
+                        let ap = networks.entry(bssid.clone()).or_insert_with(|| {
+                            AccessPoint {
+                                bssid: bssid.clone(),
+                                ssid: "<Unknown>".to_string(), // We don't know this until a beacon arrives
+                                beacon_count: 0,
+                                clients: HashMap::new(),
+                            }
+                        });
+
+                        // 2. Now insert or update the client within that AP
+                        ap.clients
+                            .entry(client_mac.clone())
+                            .and_modify(|client| client.packet_count += 1)
+                            .or_insert_with(|| Client {
+                                mac: client_mac,
+                                packet_count: 1,
+                            });
+                    }
+                }
             }
         }
         Err(pcap::Error::TimeoutExpired) => {
-            // Timeouts are normal (we set a 250ms timeout in our Capture handle).
-            // It just unblocks the loop so we can check for Ctrl+C.
+            // Timeouts are normal, just unblocks the loop
         }
         Err(e) => {
-            eprintln!("Capture error: {:?}", e);
+            eprintln!("[-] Capture error: {:?}", e);
+            return;
         }
     }
 }
 
-/// Takes raw packet bytes from pcap, strips the Radiotap header,
-/// and attempts to parse it as an 802.11 Beacon frame.
-fn process_packet(packet: &[u8]) -> Option<AccessPoint> {
-    // 1. Skip the Radiotap Header
-    // The length is always a little-endian u16 at bytes 2 and 3.
+fn process_packet(packet: &[u8]) -> Option<ParsedPacket> {
     if packet.len() < 4 {
         return None;
     }
     let rtap_len = u16::from_le_bytes([packet[2], packet[3]]) as usize;
-
-    // Ensure there is actual data after the Radiotap header
     if packet.len() <= rtap_len {
         return None;
     }
-
-    // Slice off the Radiotap header
     let wifi_data = &packet[rtap_len..];
 
     let frame = match libwifi::parse_frame(wifi_data, false) {
         Ok(f) => f,
-        Err(e) => {
-            println!("{:?}", e);
-            return None;
-        }
+        Err(_) => return None,
     };
 
-    // println!("[+] Packet captured of type: {:?}", frame);
-    print_frame(&frame);
-
-    // 2. Parse the pure 802.11 frame using libwifi
     match frame {
-        Frame::Beacon(beacon) => {
-            let bssid = beacon.header.address_3.to_string();
-            let ssid = beacon.station_info.ssid();
-
-            Some(AccessPoint {
-                bssid,
-                ssid,
-                beacon_count: 1, // Initial count when first discovered
+        // ==========================================
+        // 1. AP Discovery (Frames containing SSIDs)
+        // ==========================================
+        Frame::Beacon(f) => Some(ParsedPacket::ApBeacon {
+            bssid: f.header.address_3.to_string(),
+            ssid: f.station_info.ssid(),
+        }),
+        Frame::ProbeResponse(f) => {
+            // Probe Responses are essentially directed Beacons sent back to a client.
+            Some(ParsedPacket::ApBeacon {
+                bssid: f.header.address_3.to_string(),
+                ssid: f.station_info.ssid(),
             })
         }
-        _ => None,
+
+        // ==========================================
+        // 2. Management & Auth (Map Clients to APs)
+        // ==========================================
+        Frame::AssociationRequest(f) => extract_mgmt_activity(
+            &f.header.address_1,
+            &f.header.address_2,
+            &f.header.address_3,
+        ),
+        Frame::AssociationResponse(f) => extract_mgmt_activity(
+            &f.header.address_1,
+            &f.header.address_2,
+            &f.header.address_3,
+        ),
+        Frame::ReassociationRequest(f) => extract_mgmt_activity(
+            &f.header.address_1,
+            &f.header.address_2,
+            &f.header.address_3,
+        ),
+        Frame::ReassociationResponse(f) => extract_mgmt_activity(
+            &f.header.address_1,
+            &f.header.address_2,
+            &f.header.address_3,
+        ),
+        Frame::Authentication(f) => extract_mgmt_activity(
+            &f.header.address_1,
+            &f.header.address_2,
+            &f.header.address_3,
+        ),
+        Frame::Deauthentication(f) => extract_mgmt_activity(
+            &f.header.address_1,
+            &f.header.address_2,
+            &f.header.address_3,
+        ),
+        Frame::Action(f) => extract_mgmt_activity(
+            &f.header.address_1,
+            &f.header.address_2,
+            &f.header.address_3,
+        ),
+
+        // Probe requests are broadcasted by clients looking for APs.
+        // We ignore them here because they don't usually give us a solid AP<->Client link.
+        Frame::ProbeRequest(_) => None,
+
+        // ==========================================
+        // 3. Control Frames (Not enough info)
+        // ==========================================
+        // Control frames usually only have 1 or 2 MAC addresses and no BSSID context.
+        Frame::Rts(_) => None,
+        Frame::Cts(_) => None,
+        Frame::Ack(_) => None,
+        Frame::BlockAckRequest(_) => None,
+        Frame::BlockAck(_) => None,
+
+        // ==========================================
+        // 4. Data Frames (Map Clients to APs)
+        // ==========================================
+        // All of these share the exact same Header structure containing Frame Control flags.
+        Frame::Data(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::QosData(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::NullData(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::QosNull(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+
+        Frame::DataCfAck(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::DataCfPoll(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::DataCfAckCfPoll(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::CfAck(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::CfPoll(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::CfAckCfPoll(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+
+        Frame::QosDataCfAck(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::QosDataCfPoll(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::QosDataCfAckCfPoll(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::QosCfPoll(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
+        Frame::QosCfAckCfPoll(f) => extract_data_activity(
+            &f.header.frame_control,
+            &f.header.address_1,
+            &f.header.address_2,
+        ),
     }
 }
 
-fn print_frame(frame: &Frame) {
-    match frame {
-        // Management Frames
-        Frame::Beacon(d) => println!(
-            "Beacon: TO: {}\t FROM: {}",
-            d.header.address_1, d.header.address_2
-        ),
-        Frame::ProbeRequest(d) => println!(
-            "Probe Request: TO: {}\tFROM: {}",
-            d.header.address_1, d.header.address_2
-        ),
-        Frame::ProbeResponse(d) => println!(
-            "Probe Response: TO: {} FROM: {}",
-            d.header.address_1, d.header.address_2
-        ),
-        Frame::AssociationRequest(_) => println!("Association Request"),
-        Frame::AssociationResponse(_) => println!("Association Response"),
-        Frame::ReassociationRequest(_) => println!("Reassociation Request"),
-        Frame::ReassociationResponse(_) => println!("Reassociation Response"),
-        Frame::Action(_) => println!("Action"),
+/// Extracts Client/AP relationships from standard Data frames using the ToDS and FromDS direction flags.
+fn extract_data_activity(
+    fc: &FrameControl,
+    addr1: &MacAddress,
+    addr2: &MacAddress,
+) -> Option<ParsedPacket> {
+    let a1 = addr1.to_string();
+    let a2 = addr2.to_string();
 
-        // Authentication
-        Frame::Authentication(_) => println!("Authentication"),
-        Frame::Deauthentication(_) => println!("Deauthentication"),
+    // Ignore broadcast frames (like ARP requests)
+    if a1 == "ffffffffffff" || a2 == "ffffffffffff" {
+        return None;
+    }
 
-        // Control Frames
-        Frame::Rts(_) => println!("RTS"),
-        Frame::Cts(_) => println!("CTS"),
-        Frame::Ack(_) => println!("ACK"),
-        Frame::BlockAckRequest(_) => println!("Block ACK Request"),
-        Frame::BlockAck(_) => println!("Block ACK"),
+    if fc.to_ds() && !fc.from_ds() {
+        // Client uploading to AP. Addr1 = AP (Receiver), Addr2 = Client (Transmitter)
+        Some(ParsedPacket::ClientActivity {
+            bssid: a1,
+            client_mac: a2,
+        })
+    } else if !fc.to_ds() && fc.from_ds() {
+        // AP downloading to Client. Addr1 = Client (Receiver), Addr2 = AP (Transmitter)
+        Some(ParsedPacket::ClientActivity {
+            bssid: a2,
+            client_mac: a1,
+        })
+    } else {
+        // Ad-hoc, Mesh, or malformed, ignore for now
+        None
+    }
+}
 
-        // Data Frames
-        Frame::Data(_) => println!("Data"),
-        Frame::QosData(_) => println!("QoS Data"),
-        Frame::DataCfAck(_) => println!("Data + CF-ACK"),
-        Frame::DataCfPoll(_) => println!("Data + CF-Poll"),
-        Frame::DataCfAckCfPoll(_) => println!("Data + CF-ACK + CF-Poll"),
-        Frame::CfAck(_) => println!("CF-ACK"),
-        Frame::CfPoll(_) => println!("CF-Poll"),
-        Frame::CfAckCfPoll(_) => println!("CF-ACK + CF-Poll"),
-        Frame::QosDataCfAck(_) => println!("QoS Data + CF-ACK"),
-        Frame::QosDataCfPoll(_) => println!("QoS Data + CF-Poll"),
-        Frame::QosDataCfAckCfPoll(_) => println!("QoS Data + CF-ACK + CF-Poll"),
+/// Extracts Client/AP relationships from Management/Auth frames.
+/// In Management frames, Address 3 is almost always the BSSID.
+fn extract_mgmt_activity(
+    addr1: &MacAddress,
+    addr2: &MacAddress,
+    addr3: &MacAddress,
+) -> Option<ParsedPacket> {
+    let a1 = addr1.to_string();
+    let a2 = addr2.to_string();
+    let bssid = addr3.to_string();
 
-        // Null / No EAPOL
-        Frame::QosCfPoll(_) => println!("QoS CF-Poll"),
-        Frame::QosCfAckCfPoll(_) => println!("QoS CF-ACK + CF-Poll"),
-        Frame::QosNull(_) => println!("QoS Null"),
-        Frame::NullData(_) => println!("Null Data"),
+    // Ignore broadcast frames (like a router indiscriminately deauthing everything)
+    if a1 == "ffffffffffff" || a2 == "ffffffffffff" {
+        return None;
+    }
+
+    if a2 == bssid {
+        // Addr2 is the AP. Therefore, the AP is sending a packet to the Client (Addr1)
+        Some(ParsedPacket::ClientActivity {
+            bssid,
+            client_mac: a1,
+        })
+    } else if a1 == bssid {
+        // Addr1 is the AP. Therefore, the Client (Addr2) is sending a packet to the AP
+        Some(ParsedPacket::ClientActivity {
+            bssid,
+            client_mac: a2,
+        })
+    } else {
+        None
     }
 }

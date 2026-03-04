@@ -11,9 +11,9 @@ Wifislam is a toolkit designed for the analysis and exploitation of Wi-Fi networ
 
 ## Featues
 
-- [ ] Scan: Scans the spectrum and analyses traffic endpoints.
-  - [ ] Detect wlan interfaces.
-  - [ ] Select wlan interface.
+- [x] Scan: Scans the spectrum and analyses traffic endpoints.
+  - [x] Detect wlan interfaces.
+  - [x] Select wlan interface.
 - [ ] Kick: Prevent a specific device from connecting to an access point.
 - [ ] Slam: Prevent any device in range from connecting to any access point.
 

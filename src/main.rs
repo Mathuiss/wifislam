@@ -2,8 +2,10 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
+    thread,
+    time::Duration,
 };
 
 use clap::{Arg, Command};
@@ -108,21 +110,34 @@ fn list_interfaces() {
 
 fn scan(iface: &String) {
     println!("Starting WiFi scan on {}...", iface);
-    println!("Listening for beacons (Press Ctrl+C to stop)...\n");
 
-    // 1. Initialize the HashMap OUTSIDE the loop so it persists across packets
-    let mut networks: HashMap<String, models::scanner::AccessPoint> = HashMap::new();
+    // 1. Wrap the HashMap in an Arc<Mutex<>>
+    let networks = Arc::new(Mutex::new(HashMap::new()));
 
-    // 2. Accept `cap` in the closure parameters
-    run_monitor_handler(iface, |cap| {
-        scanner::capture_packets(cap, &mut networks);
+    // 2. Clone the Arc for the UI thread
+    let networks_print = Arc::clone(&networks);
+
+    // 3. Spawn the background UI thread
+    thread::spawn(move || {
+        loop {
+            // Update the UI every 1.5 seconds
+            thread::sleep(Duration::from_millis(1000));
+            view::scanner::print_table(&networks_print);
+        }
     });
 
-    // 3. Print the summary AFTER the loop exits
-    println!(
-        "\nScan finished. Total unique networks found: {}",
-        networks.len()
-    );
+    // 4. Main thread blocks here, running the capture loop
+    // Because this handles Ctrl+C, it will gracefully exit and clean up the interface
+    run_monitor_handler(iface, |cap| {
+        models::scanner::capture_packets(cap, &networks);
+    });
+
+    // // 5. Print the final summary after the user presses Ctrl+C and the loop exits
+    println!();
+
+    let final_networks = networks.lock().unwrap();
+
+    println!("\nScan finished. Results: {:#?}", final_networks);
 }
 
 fn kick(iface: &String, address: &String) {

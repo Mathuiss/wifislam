@@ -13,7 +13,7 @@ pub struct MonitorInterface {
 impl Drop for MonitorInterface {
     fn drop(&mut self) {
         println!(
-            "\n[Cleanup] Releasing {} from monitor mode and restoring to managed...",
+            "\n[ ] Releasing {} from monitor mode and restoring to managed...",
             self.iface_name
         );
 
