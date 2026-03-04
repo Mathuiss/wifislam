@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU16;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -9,19 +11,21 @@ use libwifi::Frame;
 use pcap::Active;
 use pcap::Capture;
 
-#[derive(Debug, Clone)]
-pub struct Client {
-    pub mac: String,
-    pub packet_count: u32,
-}
-
+/// Base struct for storing data regarding detected access points.
 #[derive(Debug, Clone)]
 pub struct AccessPoint {
     pub bssid: String,
     pub ssid: String,
+    pub channel: u16,
     pub beacon_count: u32,
     // A map of connected clients, keyed by the client's MAC address
     pub clients: HashMap<String, Client>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Client {
+    pub mac: String,
+    pub packet_count: u32,
 }
 
 /// Represents the actionable data we extracted from a raw packet
@@ -32,15 +36,19 @@ pub enum ParsedPacket {
     ClientActivity { bssid: String, client_mac: String },
 }
 
-pub fn capture_packets(
+pub fn capture_packet(
     cap: &mut Capture<Active>,
     networks_arc: &Arc<Mutex<HashMap<String, AccessPoint>>>,
+    current_channel: &Arc<AtomicU16>,
 ) {
     match cap.next_packet() {
         Ok(packet) => {
             if let Some(parsed) = process_packet(packet.data) {
                 // Lock the Mutex only when we have data to write
                 let mut networks = networks_arc.lock().unwrap();
+
+                // Read the current channel
+                let ch = current_channel.load(Ordering::Relaxed);
 
                 match parsed {
                     ParsedPacket::ApBeacon { bssid, ssid } => {
@@ -49,6 +57,7 @@ pub fn capture_packets(
                             .entry(bssid.clone())
                             .and_modify(|ap| {
                                 ap.beacon_count += 1;
+                                ap.channel = ch;
                                 // If we previously inferred this AP from client traffic,
                                 // update its SSID now that we have a real Beacon!
                                 if ap.ssid == "<Unknown>" && ssid != "<Hidden>" {
@@ -59,6 +68,7 @@ pub fn capture_packets(
                                 AccessPoint {
                                     bssid,
                                     ssid,
+                                    channel: ch,
                                     beacon_count: 1,
                                     clients: HashMap::new(), // Initialize empty client map
                                 }
@@ -70,6 +80,7 @@ pub fn capture_packets(
                             AccessPoint {
                                 bssid: bssid.clone(),
                                 ssid: "<Unknown>".to_string(), // We don't know this until a beacon arrives
+                                channel: ch,
                                 beacon_count: 0,
                                 clients: HashMap::new(),
                             }
@@ -101,10 +112,12 @@ fn process_packet(packet: &[u8]) -> Option<ParsedPacket> {
     if packet.len() < 4 {
         return None;
     }
+
     let rtap_len = u16::from_le_bytes([packet[2], packet[3]]) as usize;
     if packet.len() <= rtap_len {
         return None;
     }
+
     let wifi_data = &packet[rtap_len..];
 
     let frame = match libwifi::parse_frame(wifi_data, false) {

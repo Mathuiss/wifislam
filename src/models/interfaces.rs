@@ -1,4 +1,12 @@
-use std::process::Command;
+use std::{
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, AtomicU16, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 use pcap::{Active, Capture, Device};
 use pnet::datalink::{self, NetworkInterface};
@@ -112,5 +120,44 @@ pub fn enable_monitor_mode(iface_name: &String) -> Result<MonitorInterface, Moni
     Ok(MonitorInterface {
         capture_handle: cap,
         iface_name: iface_name.clone(),
+    })
+}
+
+/// Spawns a background thread that continuously cycles the wireless
+/// adapter through 2.4GHz and 5GHz channels.
+pub fn start_channel_hopper(
+    iface: String,
+    running: Arc<AtomicBool>,
+    current_channel: Arc<AtomicU16>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        // Standard 2.4GHz channels and common non-DFS 5GHz channels
+        let channels = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 36, 40, 44, 48, 149, 153, 157, 161, 165,
+        ];
+
+        let mut index = 0;
+
+        while running.load(Ordering::SeqCst) {
+            // Get the current channel from the list
+            let ch = channels[index];
+
+            // Store the channel as a shared variable across threads
+            current_channel.store(ch, Ordering::SeqCst);
+
+            // Execute the Linux command: iw dev wlan0 set channel X
+            // We use `.output()` instead of `.status()` to completely suppress
+            // any stdout/stderr spam. If an adapter doesn't support 5GHz,
+            // this command will just silently fail and move to the next channel!
+            let _ = Command::new("iw")
+                .args(["dev", &iface, "set", "channel", &ch.to_string()])
+                .output();
+
+            // Move to the next channel, wrapping around to the beginning
+            index = (index + 1) % channels.len();
+
+            // Wait long enough to catch beacons (102.4ms is standard)
+            thread::sleep(Duration::from_millis(100));
+        }
     })
 }

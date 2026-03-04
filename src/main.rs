@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -10,8 +10,6 @@ use std::{
 
 use clap::{Arg, Command};
 use pcap::{Active, Capture};
-
-use crate::models::scanner;
 
 mod error;
 mod models;
@@ -74,6 +72,8 @@ fn main() {
     // Parse the command line arguments
     let matches = cmd.get_matches();
 
+    let running = Arc::new(AtomicBool::new(true));
+
     // Handle the subcommands
     match matches.subcommand() {
         Some(("ifaces", _)) => list_interfaces(),
@@ -81,7 +81,7 @@ fn main() {
             let iface = sub_matches
                 .get_one::<String>("iface")
                 .expect("No interface provided");
-            scan(iface);
+            scan(running, iface);
         }
         Some(("kick", sub_matches)) => {
             let iface = sub_matches
@@ -90,13 +90,13 @@ fn main() {
             let address = sub_matches
                 .get_one::<String>("address")
                 .expect("No address provided");
-            kick(iface, address);
+            kick(running, iface, address);
         }
         Some(("slam", sub_matches)) => {
             let iface = sub_matches
                 .get_one::<String>("iface")
                 .expect("No interface provided");
-            slam(iface);
+            slam(running, iface);
         }
         _ => {
             println!("No valid subcommand provided. Use --help to see available commands.");
@@ -108,7 +108,7 @@ fn list_interfaces() {
     view::interfaces::print_interfaces(&interfaces);
 }
 
-fn scan(iface: &String) {
+fn scan(running: Arc<AtomicBool>, iface: &String) {
     println!("Starting WiFi scan on {}...", iface);
 
     // 1. Wrap the HashMap in an Arc<Mutex<>>
@@ -118,8 +118,9 @@ fn scan(iface: &String) {
     let networks_print = Arc::clone(&networks);
 
     // 3. Spawn the background UI thread
+    let running_print = running.clone();
     thread::spawn(move || {
-        loop {
+        while running_print.load(Ordering::Relaxed) {
             // Update the UI every 1.5 seconds
             thread::sleep(Duration::from_millis(1000));
             view::scanner::print_table(&networks_print);
@@ -128,8 +129,8 @@ fn scan(iface: &String) {
 
     // 4. Main thread blocks here, running the capture loop
     // Because this handles Ctrl+C, it will gracefully exit and clean up the interface
-    run_monitor_handler(iface, |cap| {
-        models::scanner::capture_packets(cap, &networks);
+    run_monitor_handler(running, iface, |cap, current_channel| {
+        models::scanner::capture_packet(cap, &networks, current_channel);
     });
 
     // // 5. Print the final summary after the user presses Ctrl+C and the loop exits
@@ -140,43 +141,46 @@ fn scan(iface: &String) {
     println!("\nScan finished. Results: {:#?}", final_networks);
 }
 
-fn kick(iface: &String, address: &String) {
+fn kick(running: Arc<AtomicBool>, iface: &String, address: &String) {
     println!("[ ] Kicking {} on {}...", address, iface);
 
     // Accept `cap` here too!
-    run_monitor_handler(iface, |cap| {
+    run_monitor_handler(running, iface, |_cap, _current_channel| {
         // TODO: Implement actual deauth packet injection here
     });
 }
 
-fn slam(iface: &String) {
+fn slam(running: Arc<AtomicBool>, iface: &String) {
     println!("[ ] Slamming all WiFi devices on {}...", iface);
 
     // Accept `cap` here too!
-    run_monitor_handler(iface, |cap| {
+    run_monitor_handler(running, iface, |_cap, _current_channel| {
         // TODO: Implement slam logic here
     });
 }
 
 /// A helper function to manage the Ctrl+C state and keep the monitor mode guard alive
-fn run_monitor_handler<F>(iface: &String, mut action: F)
+fn run_monitor_handler<F>(running: Arc<AtomicBool>, iface: &String, mut action: F)
 where
     // UPDATE: The closure now requires a mutable reference to the Capture handle
-    F: FnMut(&mut Capture<Active>),
+    F: FnMut(&mut Capture<Active>, &Arc<AtomicU16>),
 {
-    // 1. Set up the interrupt flag
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
+    // 1. Set initial state variables
+    let running_ctrlc = running.clone();
+    let running_hopper = running.clone(); // Clone for the hopper thread
+
+    // Register channels
+    let channel = Arc::new(AtomicU16::new(1));
+    let channel_hopper = channel.clone(); // For the hopper thread
 
     // 2. Register the Ctrl+C handler
     ctrlc::set_handler(move || {
         println!("\n[ ] Ctrl+C detected! Initiating graceful shutdown...");
-        r.store(false, Ordering::SeqCst);
+        running_ctrlc.store(false, Ordering::SeqCst);
     })
     .expect("[-] Error setting Ctrl-C handler");
 
     // 3. Enable monitor mode (this creates the RAII guard)
-    // UPDATE: Make the guard mutable so we can borrow the capture handle inside it
     let mut monitor_guard = match models::interfaces::enable_monitor_mode(iface) {
         Ok(guard) => guard,
         Err(e) => {
@@ -187,14 +191,12 @@ where
 
     println!("[ ] Running... Press Ctrl+C to stop.");
 
-    // 4. Run the continuous loop
-    while running.load(Ordering::SeqCst) {
-        // UPDATE: Pass the capture handle to the closure
-        action(&mut monitor_guard.capture_handle);
+    // 4. Start channel hopper
+    models::interfaces::start_channel_hopper(iface.clone(), running_hopper, channel_hopper);
 
-        // REMOVED `thread::sleep` here!
-        // pcap handles its own sleeping via the timeout we set.
-        // Sleeping here would cause you to miss packets!
+    // 5. Call closure
+    while running.load(Ordering::SeqCst) {
+        action(&mut monitor_guard.capture_handle, &channel);
     }
 
     println!("[ ] Exiting process...");

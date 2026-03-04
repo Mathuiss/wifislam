@@ -18,12 +18,19 @@ pub fn print_table(networks_arc: &Arc<Mutex<HashMap<String, AccessPoint>>>) {
 
     let mut table = Table::new();
     table.load_preset(NOTHING);
-    table.set_header(vec!["BSSID", "SSID", "Beacons", "Clients Connected"]);
+    table.set_header(vec![
+        "BSSID",
+        "SSID",
+        "Channel",
+        "Beacons",
+        "Clients Connected",
+    ]);
 
     for (bssid, ap) in networks.iter() {
         table.add_row(vec![
             bssid,
             &ap.ssid,
+            &ap.channel.to_string(),
             &ap.beacon_count.to_string(),
             &ap.clients.len().to_string(),
         ]);
